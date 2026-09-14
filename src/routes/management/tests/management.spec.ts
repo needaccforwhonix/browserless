@@ -1,3 +1,4 @@
+import * as http from 'http';
 import {
   exists,
   Browserless,
@@ -160,6 +161,25 @@ describe('Management APIs', function () {
   });
 
   describe('Static Files Serving', () => {
+    it('loads the docs favicon after the directory redirect', async () => {
+      await start();
+
+      const page = await fetch('http://localhost:3000/docs');
+      expect(page.status).to.equal(200);
+      expect(new URL(page.url).pathname).to.equal('/docs/');
+      const html = await page.text();
+      const favicon = html.match(/rel="icon" href="([^"]+)"/)?.[1];
+      expect(favicon).to.be.a('string');
+
+      expect(
+        new URL(favicon!, 'http://localhost:3000/browserless/docs/').pathname,
+      ).to.equal('/browserless/favicon-32x32.png');
+
+      const icon = await fetch(new URL(favicon!, page.url));
+      expect(icon.status).to.equal(200);
+      expect(icon.headers.get('content-type')).to.equal('image/png');
+    });
+
     it('serves docs pages', async () => {
       await start();
 
@@ -195,6 +215,36 @@ describe('Management APIs', function () {
         const content = await res.json();
         expect(content).to.be.an('object');
       });
+    });
+
+    it('serves the images the docs page resolves against /docs/', async () => {
+      await start();
+
+      const spec = await fetch(
+        'http://localhost:3000/docs/swagger.json?token=6R0W53R135510',
+      ).then((res) => res.json() as Promise<any>);
+
+      const references: string[] = [
+        spec.info['x-logo'].url,
+        ...[
+          ...spec.info.description.matchAll(/(?:src|srcset)="(\.\/[^"]+)"/g),
+        ].map(([, url]) => url),
+      ];
+
+      expect(references.length).to.be.greaterThan(1);
+
+      await Promise.all(
+        references.map(async (reference) => {
+          const url = new URL(reference, 'http://localhost:3000/docs/');
+          url.searchParams.set('token', '6R0W53R135510');
+
+          const res = await fetch(url);
+          expect(res.status, reference).to.equal(200);
+          expect(res.headers.get('content-type'), reference).to.match(
+            /^image\//,
+          );
+        }),
+      );
     });
 
     it('returns 404 if debugger is disabled', async () => {
@@ -391,6 +441,22 @@ describe('Management APIs', function () {
       `http://localhost:3000/kill/invalid-session?token=6R0W53R135510`,
     ).then(async (res) => {
       expect(res.status).to.equal(404);
+    });
+  });
+
+  it('handles non-WebSocket upgrade requests (h2c) as normal HTTP', async () => {
+    await start();
+
+    await new Promise<http.IncomingMessage>((resolve, reject) => {
+      http
+        .get(
+          'http://localhost:3000/config?token=6R0W53R135510',
+          { headers: { Connection: 'Upgrade', Upgrade: 'h2c' } },
+          resolve,
+        )
+        .on('error', reject);
+    }).then(async (res) => {
+      expect(res.statusCode).to.equal(200);
     });
   });
 });

@@ -6,6 +6,7 @@ import {
   ChromiumCDP,
   ChromiumPlaywright,
   Config,
+  ErrorCode,
   FirefoxPlaywright,
   HTTPManagementRoutes,
   HTTPRoutes,
@@ -25,10 +26,7 @@ import {
 } from 'puppeteer-core';
 
 export type PathTypes =
-  | HTTPRoutes
-  | WebsocketRoutes
-  | HTTPManagementRoutes
-  | string;
+  HTTPRoutes | WebsocketRoutes | HTTPManagementRoutes | string;
 
 export interface BeforeRequest {
   head?: Buffer;
@@ -42,6 +40,12 @@ export interface AfterResponse {
   start: number;
   status: 'successful' | 'error' | 'timedout';
   error?: Error;
+  /**
+   * The route that handled the request, when one matched — so `after()`
+   * consumers can identify which route ran without re-matching the request
+   * against the router. Omitted when no route ran (e.g. an unmatched 404).
+   */
+  route?: Route;
 }
 
 export interface BrowserHook {
@@ -70,10 +74,7 @@ export type BrowserClasses =
   | typeof WebKitPlaywright;
 
 export type BrowserInstance =
-  | ChromiumCDP
-  | ChromiumPlaywright
-  | FirefoxPlaywright
-  | WebKitPlaywright;
+  ChromiumCDP | ChromiumPlaywright | FirefoxPlaywright | WebKitPlaywright;
 
 export interface BrowserJSON {
   Browser: string;
@@ -92,7 +93,7 @@ type defaultLaunchOptions =
   | BrowserlessLaunch
   | ((req: Request) => CDPLaunchOptions | BrowserlessLaunch);
 
-abstract class Route {
+export abstract class Route<Req extends Request = Request> {
   constructor(
     protected _browserManager: Browserless['browserManager'],
     protected _config: Browserless['config'],
@@ -113,7 +114,7 @@ abstract class Route {
    * A boolean, or a function that returns a boolean, on
    * whether the route requires an API token to access.
    */
-  auth: boolean | ((req: Request) => Promise<boolean>) = true;
+  auth: boolean | ((req: Req) => Promise<boolean>) = true;
 
   /**
    * The schematic of the submitted BODY (typically)
@@ -141,6 +142,15 @@ abstract class Route {
    * concurrency limit defined in your configuration.
    */
   concurrency: boolean = true;
+
+  /**
+   * Optional per-request predicate. When it returns true, the limiter skips
+   * both the CPU/memory health-check rejection and the queue-capacity
+   * rejection for this request. Timeouts, metrics, and after-hooks still
+   * apply. Useful for lightweight requests (e.g. reconnects to an in-flight
+   * browser) that should not be turned away by host load or admission caps.
+   */
+  bypassLimits?: (req: Req) => boolean;
 
   /**
    * Description of the route and what it does. This description
@@ -208,6 +218,12 @@ abstract class Route {
   abstract path: PathTypes | Array<PathTypes>;
 
   /**
+   * Optional per-route error codes beyond the defaults (400, 401, 404, 408, 429, 500).
+   * Merged with the global error codes in the OpenAPI documentation.
+   */
+  errorCodes?: Record<number, ErrorCode>;
+
+  /**
    * The tag(s) for the route to categorize it in the
    * documentation portal
    */
@@ -219,7 +235,9 @@ abstract class Route {
  * browser in order to fulfill requests. Used by downstream HTTPRoute
  * and WebSocketRoute
  */
-abstract class BasicHTTPRoute extends Route {
+abstract class BasicHTTPRoute<
+  Req extends Request = Request,
+> extends Route<Req> {
   /**
    * The allowed Content-Types that this route can read and handle.
    * If a request comes in with a Content-Type of 'application/json', then
@@ -244,21 +262,24 @@ abstract class BasicHTTPRoute extends Route {
    * Useful if you need to alter something about the request to conform it or otherwise. This
    * hook is ran after any "global" hooks have run.
    */
-  before?: (req: Request, res: http.ServerResponse) => Promise<boolean>;
+  before?: (req: Req, res: http.ServerResponse) => Promise<boolean>;
 }
 
 /**
  * A HTTP-based route, with a handler, that can fulfill requests without
  * a browser required.
  */
-export abstract class HTTPRoute extends BasicHTTPRoute {
+export abstract class HTTPRoute<
+  Req extends Request = Request,
+  Log extends Logger = Logger,
+> extends BasicHTTPRoute<Req> {
   /**
    * Handles an inbound HTTP request, and supplies the Request and Response objects from node's HTTP request event
    */
   abstract handler(
-    req: Request,
+    req: Req,
     res: http.ServerResponse,
-    logger: Logger,
+    logger: Log,
   ): Promise<unknown>;
 }
 
@@ -267,7 +288,11 @@ export abstract class HTTPRoute extends BasicHTTPRoute {
  * requires a browser in order to do so. Handler will then be called
  * with a 3rd argument of the browser class specified.
  */
-export abstract class BrowserHTTPRoute extends BasicHTTPRoute {
+export abstract class BrowserHTTPRoute<
+  Browser extends BrowserInstance = BrowserInstance,
+  Req extends Request = Request,
+  Log extends Logger = Logger,
+> extends BasicHTTPRoute<Req> {
   defaultLaunchOptions?: defaultLaunchOptions;
 
   abstract browser: BrowserClasses;
@@ -275,12 +300,17 @@ export abstract class BrowserHTTPRoute extends BasicHTTPRoute {
   /**
    * Handles an inbound HTTP request with a 3rd param of the predefined
    * browser used for the route -- only Chrome CDP is support currently.
+   *
+   * All handler argument types default to the built-in types, but downstream
+   * SDK projects can supply their own (a subclass or a wider type) via the
+   * `Browser`, `Req`, and `Log` type parameters to get accurate typing inside
+   * their handler without casting.
    */
   abstract handler(
-    req: Request,
+    req: Req,
     res: http.ServerResponse,
-    logger: Logger,
-    browser: BrowserInstance,
+    logger: Log,
+    browser: Browser,
   ): Promise<unknown>;
 
   /**
@@ -294,27 +324,26 @@ export abstract class BrowserHTTPRoute extends BasicHTTPRoute {
  * A WebSocket-based route, with a handler, that can fulfill requests
  * that do not require a browser in order to operate.
  */
-export abstract class WebSocketRoute extends Route {
+export abstract class WebSocketRoute<
+  Req extends Request = Request,
+  Log extends Logger = Logger,
+> extends Route<Req> {
   browser = null;
 
   /**
    * Handles an inbound Websocket request, and handles the connection
    */
   abstract handler(
-    req: Request,
+    req: Req,
     socket: stream.Duplex,
     head: Buffer,
-    logger: Logger,
+    logger: Log,
   ): Promise<unknown>;
 
   /**
    * Handles an inbound HTTP request, and supplies the Request and Response objects from node's HTTP request event
    */
-  before?: (
-    req: Request,
-    socket: stream.Duplex,
-    head: Buffer,
-  ) => Promise<boolean>;
+  before?: (req: Req, socket: stream.Duplex, head: Buffer) => Promise<boolean>;
 }
 
 /**
@@ -322,7 +351,11 @@ export abstract class WebSocketRoute extends Route {
  * that need a browser. Handler is called with an additional argument of
  * browser (the browser class required to run the route).
  */
-export abstract class BrowserWebsocketRoute extends Route {
+export abstract class BrowserWebsocketRoute<
+  Browser extends BrowserInstance = BrowserInstance,
+  Req extends Request = Request,
+  Log extends Logger = Logger,
+> extends Route<Req> {
   abstract browser: BrowserClasses;
 
   defaultLaunchOptions?: defaultLaunchOptions;
@@ -330,13 +363,18 @@ export abstract class BrowserWebsocketRoute extends Route {
   /**
    * Handles an inbound Websocket request, and handles the connection
    * with the prior set browser being injected.
+   *
+   * All handler argument types default to the built-in types, but downstream
+   * SDK projects can supply their own (a subclass or a wider type) via the
+   * `Browser`, `Req`, and `Log` type parameters to get accurate typing inside
+   * their handler without casting.
    */
   abstract handler(
-    req: Request,
+    req: Req,
     socket: stream.Duplex,
     head: Buffer,
-    logger: Logger,
-    browser: BrowserInstance,
+    logger: Log,
+    browser: Browser,
   ): Promise<unknown>;
 
   /**
@@ -348,11 +386,7 @@ export abstract class BrowserWebsocketRoute extends Route {
   /**
    * Handles an inbound HTTP request, and supplies the Request and Response objects from node's HTTP request event
    */
-  before?: (
-    req: Request,
-    socket: stream.Duplex,
-    head: Buffer,
-  ) => Promise<boolean>;
+  before?: (req: Req, socket: stream.Duplex, head: Buffer) => Promise<boolean>;
 }
 
 interface BrowserlessLaunch {
@@ -381,6 +415,11 @@ export interface CDPLaunchOptions extends BrowserlessLaunch {
   timeout?: number;
   userDataDir?: string;
   waitForInitialPage?: boolean;
+  // `launch` is a passthrough to puppeteer.launch(): the parsed object is
+  // spread straight to the launcher, which ignores keys it doesn't recognize.
+  // Forward launcher options outside this documented subset rather than
+  // rejecting the connection.
+  [key: string]: unknown;
 }
 
 export interface BrowserLauncherOptions {
@@ -395,6 +434,16 @@ export interface BrowserServerOptions {
   chromiumSandbox?: boolean;
   devtools?: boolean;
   downloadsPath?: string;
+  /**
+   * Environment for the browser process. Honored by both puppeteer.launch and
+   * playwright.launchServer. Set server-side to give the session its own TMPDIR
+   * (see generateScratchDir); a caller-supplied value is merged under it, since
+   * a session must not be able to point its scratch back at the shared temp dir.
+   *
+   * That merge happens on the object handed to `launch` only. It is kept off
+   * the session's stored `launchOptions`, which /sessions serves verbatim.
+   */
+  env?: Record<string, string | undefined>;
   headless?: boolean;
   ignoreDefaultArgs?: boolean | string[];
   proxy?: {
@@ -405,6 +454,11 @@ export interface BrowserServerOptions {
   };
   timeout?: number;
   tracesDir?: string;
+  // `launch` is a passthrough to playwright.launchServer(): the parsed object
+  // is spread straight to the launcher, which ignores keys it doesn't
+  // recognize. Forward launcher options outside this documented subset rather
+  // than rejecting the connection.
+  [key: string]: unknown;
 }
 
 export interface BrowserlessSession {
@@ -415,6 +469,12 @@ export interface BrowserlessSession {
   numbConnected: number;
   resolver(val: unknown): void;
   routePath: string | string[];
+  /**
+   * This session's TMPDIR, removed on close. Unlike userDataDir it is always
+   * browserless-owned, so it is reclaimed whether or not the caller supplied
+   * their own data dir.
+   */
+  scratchDir: string | null;
   startedOn: number;
   trackingId?: string;
   ttl: number;
@@ -442,6 +502,14 @@ export interface BrowserlessSessionFullJSON extends BrowserlessSessionJSON {
     url: string;
   }[];
 }
+
+export type ContextValue =
+  | string
+  | number
+  | boolean
+  | null
+  | ContextValue[]
+  | { [key: string]: ContextValue };
 
 export type UnwrapPromise<T> = T extends Promise<infer U> ? U : T;
 

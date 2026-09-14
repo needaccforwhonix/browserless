@@ -5,6 +5,12 @@ import {
 
 import http from 'http';
 
+export interface ErrorCode {
+  readonly code: number;
+  readonly description: string;
+  readonly message: string;
+}
+
 export const errorCodes = {
   400: {
     code: 400,
@@ -15,6 +21,11 @@ export const errorCodes = {
     code: 401,
     description: `The request is missing, or contains bad, authorization credentials.`,
     message: 'HTTP/1.1 401 Unauthorized',
+  },
+  403: {
+    code: 403,
+    description: `The request targets a destination that is not allowed.`,
+    message: 'HTTP/1.1 403 Forbidden',
   },
   404: {
     code: 404,
@@ -41,7 +52,7 @@ export const errorCodes = {
     description: `Service is unavailable.`,
     message: 'HTTP/1.1 503 Service Unavailable',
   },
-} as const;
+} as const satisfies Record<number, ErrorCode>;
 
 export const okCodes = {
   200: {
@@ -54,12 +65,12 @@ export const okCodes = {
     description: `The request ran successfully, but no response was necessary.`,
     message: 'HTTP/1.1 204 No Content',
   },
-} as const;
+} as const satisfies Record<number, ErrorCode>;
 
 export const codes = {
   ...errorCodes,
   ...okCodes,
-} as const;
+} as const satisfies Record<number, ErrorCode>;
 
 export enum contentTypes {
   any = '*/*',
@@ -151,9 +162,9 @@ export enum HTTPManagementRoutes {
 }
 
 export enum APITags {
-  'browserAPI' = 'Browser REST APIs',
-  'browserWS' = 'Browser WebSocket APIs',
-  'management' = 'Management REST APIs',
+  browserAPI = 'Browser REST APIs',
+  browserWS = 'Browser WebSocket APIs',
+  management = 'Management REST APIs',
 }
 
 export interface Request extends http.IncomingMessage {
@@ -171,6 +182,9 @@ export interface SystemQueryParameters {
    * to not load properly.
    */
   blockAds?: boolean;
+
+  /** Ruleset IDs to load when `blockAds` is enabled, as CSV or JSON-array text. */
+  blockAdsInclude?: string;
 
   /**
    * Launch options, which can be either an object
@@ -195,4 +209,11 @@ export interface SystemQueryParameters {
    * Custom session identifier
    */
   trackingId?: string;
+
+  /**
+   * Name of an authenticated profile to hydrate into the browser at launch.
+   * The profile's cookies, localStorage and IndexedDB are injected via CDP
+   * before your code runs. No-op in builds without a profile subsystem.
+   */
+  profile?: string;
 }

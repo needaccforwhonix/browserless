@@ -13,10 +13,22 @@ import path, { join } from 'path';
 import { Readable } from 'stream';
 import { deleteAsync } from 'del';
 import { cp } from 'fs/promises';
+import { extractZip } from './extract-zip-native.js';
 import os from 'os';
-import unzip from 'extract-zip';
 
 (async () => {
+  const extensionsDir = join(process.cwd(), 'extensions');
+  const uBlockLiteDir = join(extensionsDir, 'ublocklite');
+
+  // Skip the network round-trip when the extension is already installed.
+  // Set FORCE_ADBLOCK=true to re-fetch the latest uBlock Origin Lite release.
+  if (
+    existsSync(join(uBlockLiteDir, 'manifest.json')) &&
+    process.env.FORCE_ADBLOCK !== 'true'
+  ) {
+    return;
+  }
+
   const tmpDir = path.join(os.tmpdir(), '_ublite' + Date.now());
 
   // Create temporary directory if it doesn't exist
@@ -25,8 +37,6 @@ import unzip from 'extract-zip';
   }
 
   const zipFile = tmpDir + '/ublock.zip';
-  const extensionsDir = join(process.cwd(), 'extensions');
-  const uBlockLiteDir = join(extensionsDir, 'ublocklite');
 
   const downloadUrlToDirectory = (url, dir) =>
     fetch(url).then(
@@ -49,7 +59,7 @@ import unzip from 'extract-zip';
   const json = await data.json();
 
   await downloadUrlToDirectory(json.assets[0].browser_download_url, zipFile);
-  await unzip(zipFile, { dir: tmpDir });
+  await extractZip(zipFile, tmpDir);
 
   const findExtensionDir = (dir) => {
     const items = readdirSync(dir);
@@ -80,4 +90,9 @@ import unzip from 'extract-zip';
   await deleteAsync(zipFile, { force: true }).catch((err) => {
     console.warn('Could not delete temporary download file: ' + err.message);
   });
-})();
+})().catch((err) => {
+  console.error(
+    `Failed to install the uBlock Origin Lite extension: ${err.message}`,
+  );
+  process.exitCode = 1;
+});

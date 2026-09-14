@@ -19,6 +19,37 @@ const swaggerJSONMinimal = join(
   'swagger.min.json',
 );
 const packageJSONPath = join(__dirname, '..', 'package.json');
+const docsAssetsDir = join(__dirname, '..', 'static', 'docs', 'assets');
+const assetReferences = /\.\/assets\/([\w.-]+)/g;
+
+// Redoc resolves the embedded README against the docs page at `/docs/`, so
+// every `./assets/...` reference it carries has to be served from
+// `/docs/assets/`. Only `static` is served, and `assets` sits outside it.
+// Sources follow the README's own root rather than this package's, so an SDK
+// consumer's assets are used with an SDK consumer's README.
+const copyReferencedAssets = async (markdown) => {
+  const referenced = [
+    ...new Set([...markdown.matchAll(assetReferences)].map(([, file]) => file)),
+  ];
+
+  if (!referenced.length) {
+    return;
+  }
+
+  const assetsDir = join(process.cwd(), 'assets');
+
+  await fs.mkdir(docsAssetsDir, { recursive: true });
+
+  // A reference with no readable file behind it costs the docs page an image,
+  // which is never worth failing a build over.
+  await Promise.all(
+    referenced.map((file) =>
+      fs
+        .copyFile(join(assetsDir, file), join(docsAssetsDir, file))
+        .catch(() => {}),
+    ),
+  );
+};
 
 const readFileOrNull = async (path) => {
   if (!path) {
@@ -76,6 +107,8 @@ const buildOpenAPI = async (
     (await fs.readFile('CHANGELOG.md').catch(() => '')).toString(),
   );
 
+  await copyReferencedAssets(readme);
+
   const [httpRoutes, wsRoutes] = await getRouteFiles(new Config());
   const swaggerJSON = {
     customSiteTitle: 'Browserless Documentation',
@@ -85,7 +118,7 @@ const buildOpenAPI = async (
       version: JSON.parse(packageJSON.toString()).version,
       'x-logo': {
         altText: 'browserless logo',
-        url: './docs/browserless-logo-inline.svg',
+        url: './browserless-logo-inline.svg',
       },
     },
     openapi: '3.0.0',
@@ -121,7 +154,7 @@ const buildOpenAPI = async (
         const isWebSocket = routeModule.includes('/ws/') || name.endsWith('ws');
         const paths = (
           Array.isArray(route.path) ? route.path : [route.path]
-        ).map((p) => p === '?(/)' ? '/' : p.replace(/\?\(\/\)/g, ''));
+        ).map((p) => (p === '?(/)' ? '/' : p.replace(/\?\(\/\)/g, '')));
         const [path, ...alternativePaths] = paths;
 
         const {
@@ -132,6 +165,7 @@ const buildOpenAPI = async (
           accepts,
           contentTypes,
           title,
+          errorCodes: routeErrorCodes,
         } = route;
 
         const routeDocs = [description];
@@ -158,6 +192,7 @@ const buildOpenAPI = async (
           response: isWebSocket
             ? null
             : JSON.parse(await readFileOrNull(response)),
+          routeErrorCodes,
           tags,
           title,
         };
@@ -176,6 +211,7 @@ const buildOpenAPI = async (
         },
         responses: {
           ...errorCodes,
+          ...(r.routeErrorCodes || {}),
         },
         summary: r.path,
         tags: r.tags,
@@ -242,7 +278,7 @@ const buildOpenAPI = async (
       // ignores the "accepts" properties on routes since we can't
       // yet correlate the accepted types to the proper body
       if (r.body) {
-        const { properties, type, anyOf } = r.body;
+        const { properties, type, required, anyOf } = r.body;
         if (anyOf) {
           // @ts-ignore
           anyOf.forEach((anyType) => {
@@ -270,11 +306,15 @@ const buildOpenAPI = async (
 
         // Handle JSON
         if (type === 'object') {
+          const schema = {
+            properties,
+            type: 'object',
+          };
+          if (required?.length) {
+            schema.required = required;
+          }
           swaggerRoute.requestBody.content['application/json'] = {
-            schema: {
-              properties,
-              type: 'object',
-            },
+            schema,
           };
         }
       }

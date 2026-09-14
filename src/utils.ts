@@ -19,9 +19,14 @@ import {
   encryptionAlgo,
   encryptionSep,
 } from '@browserless.io/browserless';
+import {
+  GoToOptions,
+  Page,
+  PuppeteerLifeCycleEvent,
+  SetContentWaitForOptions,
+} from 'puppeteer-core';
 import playwright, { CDPSession } from 'playwright-core';
 import { Duplex } from 'stream';
-import { Page } from 'puppeteer-core';
 import { ServerResponse } from 'http';
 import crypto from 'crypto';
 import debug from 'debug';
@@ -166,33 +171,51 @@ export const isConnected = (connection: Duplex | ServerResponse): boolean =>
 export const writeResponse = (
   writeable: Duplex | ServerResponse,
   httpCode: keyof typeof codes,
-  message: string,
+  message: string | Error,
   contentType: contentTypes = contentTypes.text,
 ): void => {
   if (!isConnected(writeable)) {
     return;
   }
 
+  const isJSON = contentType.includes(contentTypes.json);
+  const isError = httpCode >= 400;
   const httpMessage = codes[httpCode];
-  const CTTHeader = `${contentType}; charset=${encodings.utf8}`;
+  let responseContentType = contentType;
+  if (isError) {
+    responseContentType = isJSON ? contentTypes.json : contentTypes.text;
+  }
+  const contentTypeHeader = responseContentType
+    .toLowerCase()
+    .includes('charset=')
+    ? responseContentType
+    : `${responseContentType}; charset=${encodings.utf8}`;
+  const body =
+    isJSON && isError
+      ? JSON.stringify({
+          error: message instanceof Error ? message.message : message,
+        })
+      : message;
 
   if (isHTTP(writeable)) {
     const response = writeable;
     if (!response.headersSent) {
-      response.writeHead(httpMessage.code, { 'Content-Type': CTTHeader });
-      response.end(message + '\n');
+      response.writeHead(httpMessage.code, {
+        'Content-Type': contentTypeHeader,
+      });
+      response.end(body + '\n');
     }
     return;
   }
 
   const httpResponse = [
     httpMessage.message,
-    `Content-Type: ${CTTHeader}`,
+    `Content-Type: ${contentTypeHeader}`,
     'Content-Encoding: UTF-8',
     'Accept-Ranges: bytes',
     'Connection: keep-alive',
     '\r\n',
-    message,
+    body,
   ].join('\r\n');
 
   writeable.write(httpResponse);
@@ -295,6 +318,35 @@ export const safeParse = (maybeJson: string): unknown | null => {
   }
 };
 
+const sensitiveBodyFields = [
+  'authenticate',
+  'authorization',
+  'cookies',
+  'headers',
+  'password',
+  'setExtraHTTPHeaders',
+  'token',
+];
+
+/**
+ * Returns a shallow copy of a request body safe for logging: fields that can
+ * carry credentials (cookies, auth headers, passwords) are replaced with a
+ * `[redacted]` marker.
+ */
+export const redactSensitiveBodyFields = (body: unknown): unknown => {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    return body;
+  }
+  return Object.fromEntries(
+    Object.entries(body).map(([key, value]) => [
+      key,
+      sensitiveBodyFields.includes(key) && value !== undefined
+        ? '[redacted]'
+        : value,
+    ]),
+  );
+};
+
 export const removeNullStringify = (
   json: unknown,
   allowNull = true,
@@ -336,6 +388,38 @@ export const generateDataDir = async (
   });
 
   return dataDirPath;
+};
+
+/**
+ * Create this session's scratch directory, to be handed to the browser as
+ * TMPDIR. Fails the session launch when it cannot be created: falling back to
+ * the inherited shared temp dir would restore the disk leak this isolation is
+ * intended to prevent.
+ *
+ * The directory name is a short slice of the session id, NOT the whole thing.
+ * Chrome's process singleton puts a unix socket beneath TMPDIR and appends ~45
+ * bytes of its own ("/org.chromium.Chromium.XXXXXX/SingletonSocket"); a full
+ * 36-char uuid here pushes the total past sun_path's 108-byte cap and Chrome
+ * exits at startup with "Socket path too long". 48 bits is ample against
+ * collision between concurrent sessions, which is all this must be unique
+ * across.
+ */
+export const generateScratchDir = async (
+  sessionId: string = id(),
+  config: Config,
+): Promise<string> => {
+  const scratchDirPath = path.join(
+    config.getScratchDir(),
+    sessionId.replace(/-/g, '').slice(0, 12),
+  );
+
+  await fs.mkdir(scratchDirPath, { recursive: true }).catch((err) => {
+    throw new ServerError(
+      `Error creating scratch directory "${scratchDirPath}": ${err}`,
+    );
+  });
+
+  return scratchDirPath;
 };
 
 export const readBody = async (
@@ -721,6 +805,14 @@ export class NotFound extends Error {
     errorLog(this.message);
   }
 }
+export class Forbidden extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'Forbidden';
+    this.message = message;
+    errorLog(this.message);
+  }
+}
 export class Timeout extends Error {
   constructor(message: string) {
     super(message);
@@ -736,6 +828,73 @@ export const bestAttemptCatch =
     if (bestAttempt) return;
     throw err;
   };
+
+/**
+ * Errors thrown by `page.content()` (and other CDP evaluations) when the
+ * page's execution context is torn down by an in-flight navigation — e.g. a
+ * client-side redirect fired right after `DOMContentLoaded`. These are
+ * transient: retrying once the DOM settles yields the serialized markup.
+ */
+const navigationTeardownError =
+  /(Execution context was destroyed|Cannot find context with specified id|Session closed|frame got detached)/i;
+
+/**
+ * Reads a page's serialized HTML, tolerating in-flight navigations.
+ *
+ * `page.content()` evaluates in the page's execution context; when a
+ * client-side redirect navigates the page mid-read, that context is destroyed
+ * and the call throws. Rather than surfacing a 500, wait for the navigation to
+ * settle and re-read, up to `retries` times.
+ */
+export const getPageContent = async (
+  page: Page,
+  {
+    retries = 3,
+    timeout = 30_000,
+  }: { retries?: number; timeout?: number } = {},
+): Promise<string> => {
+  try {
+    return await page.content();
+  } catch (err) {
+    const isTeardown =
+      err instanceof Error && navigationTeardownError.test(err.message);
+
+    if (retries <= 0 || !isTeardown) {
+      throw err;
+    }
+
+    await page
+      .waitForNavigation({ timeout, waitUntil: 'domcontentloaded' })
+      .catch(noop);
+
+    return getPageContent(page, { retries: retries - 1, timeout });
+  }
+};
+
+/**
+ * Adapts goto-style options for `page.setContent`. puppeteer-core 24.43.1
+ * removed `networkidle0`/`networkidle2` from setContent's `waitUntil`
+ * (they were always no-ops for `setContent`, which fires no network).
+ */
+export const toSetContentOptions = (
+  options?: GoToOptions,
+): SetContentWaitForOptions | undefined => {
+  if (!options) return options;
+  const { waitUntil, ...rest } = options;
+  if (waitUntil === undefined) return rest;
+  const events = Array.isArray(waitUntil) ? waitUntil : [waitUntil];
+  const supported = events.filter(
+    (
+      e,
+    ): e is Exclude<PuppeteerLifeCycleEvent, 'networkidle0' | 'networkidle2'> =>
+      e !== 'networkidle0' && e !== 'networkidle2',
+  );
+  if (supported.length === 0) return rest;
+  return {
+    ...rest,
+    waitUntil: Array.isArray(waitUntil) ? supported : supported[0],
+  };
+};
 
 export const parseBooleanParam = (
   params: URLSearchParams,
@@ -867,7 +1026,7 @@ export const printLogo = (docsLink: string, debugURL?: string | boolean) => `
 | Full Documentation: https://docs.browserless.io/ ${
   /*prettier-ignore*/
   debugURL ? `
-| Debbuger: ${debugURL}`  : ""
+| Debbuger: ${debugURL}` : ""
 }
 ---------------------------------------------------------
 ${gradient(
@@ -917,3 +1076,97 @@ export const isMatch = (text: string, pattern: string) => {
 
 export const getFinalPathSegment = (pathname: string): string | undefined =>
   pathname.split(/[?#&]/)[0].split('/').filter(Boolean).pop();
+
+/**
+ * Canonicalize a candidate URL value so trivial obfuscations cannot bypass a
+ * prefix-based blocklist:
+ *
+ *   - `FILE:///etc/passwd` / `File:///etc/passwd` — Chromium normalizes URL
+ *     schemes case-insensitively; force-lowercase.
+ *   - `  file:///etc/passwd` / `\tfile://...` — WHATWG URL parsing trims
+ *     leading whitespace before parsing.
+ *   - `f\x01ile://...` (embedded control char) — `new URL()` parses
+ *     `file://...` cleanly after we strip ASCII control chars, so the
+ *     canonical lower-cased form goes through the `try` branch. The
+ *     `catch` fallback is only reached if a value remains unparseable
+ *     after stripping.
+ *   - `file:/etc/passwd` (single slash) — `new URL()` canonicalizes to
+ *     `file:///etc/passwd`, matching Chromium's behavior.
+ *   - `view-source:file:///etc/passwd` — view-source is a wrapper that loads
+ *     the inner URL; strip recursively before matching.
+ *
+ * Returns a lower-cased canonical form. Falls back to a stripped/lowercased
+ * raw string when `new URL()` cannot parse — prefix matching still works.
+ */
+export const normalizeUrlForBlocklist = (value: string): string => {
+  // Strip ASCII control chars (including embedded NUL) before any parsing
+  // attempt — Chromium drops these during URL canonicalization, so a
+  // `\0file://…` payload would otherwise reach the fallback branch with the
+  // NUL intact and fail prefix matching.
+  let s = value.trim().replace(/[\x00-\x1f]/g, '');
+  while (/^view-source:/i.test(s)) s = s.slice('view-source:'.length);
+  try {
+    return new URL(s).href.toLowerCase();
+  } catch {
+    return s.toLowerCase();
+  }
+};
+
+/**
+ * Walks a JSON-RPC message tree looking for any field named `url`
+ * (case-insensitive) whose value, after `normalizeUrlForBlocklist`, begins
+ * with one of the supplied patterns. Returns the matched pattern, or `null`
+ * when nothing matches.
+ *
+ * Source of truth for the blocklist is `Config.getBlockedURLPatterns()`; the
+ * CDP request-event guard reads the same patterns. This helper additionally
+ * normalizes the candidate URL because Playwright JSON-RPC frames carry the
+ * client's raw string, while puppeteer's `page.on('request')` sees a URL
+ * Chromium has already canonicalized.
+ *
+ * Only inspects keys named `url` (case-insensitive — `URL`, `Url` match
+ * too). JSON values that happen to contain a `file://` substring in
+ * arbitrary user data (e.g. the return value of `page.evaluate()`) are
+ * left alone.
+ */
+export const findBlockedUrlInMessage = (
+  message: unknown,
+  patterns: string[],
+): string | null => {
+  if (patterns.length === 0) return null;
+  const lcPatterns = patterns.map((p) => p.toLowerCase());
+  const stack: unknown[] = [message];
+  while (stack.length) {
+    const cur = stack.pop();
+    if (!cur || typeof cur !== 'object') continue;
+    for (const [k, v] of Object.entries(cur as Record<string, unknown>)) {
+      if (k.toLowerCase() === 'url' && typeof v === 'string') {
+        const norm = normalizeUrlForBlocklist(v);
+        const idx = lcPatterns.findIndex((p) => norm.startsWith(p));
+        if (idx !== -1) return patterns[idx];
+      }
+      if (v && typeof v === 'object') stack.push(v);
+    }
+  }
+  return null;
+};
+
+/**
+ * Decode a `ws` frame payload to a UTF-8 string regardless of binary/text
+ * opcode. Under the default `binaryType: 'nodebuffer'` (ws ≥ 8, which this
+ * package pins), `ws` delivers both text and binary frames as a `Buffer`;
+ * the `Buffer[]` branch is defensive against `binaryType: 'fragments'` (not
+ * enabled by callers) and the `ArrayBuffer` branch covers `'arraybuffer'`.
+ *
+ * Decoding every frame — including binary ones — is deliberate: we cannot
+ * assume the upstream server only honors text-opcode JSON. If a JSON
+ * command were shipped as a binary frame and the bridge skipped it, the
+ * filter would be bypassable.
+ */
+export const wsFrameToString = (
+  data: Buffer | ArrayBuffer | Buffer[],
+): string => {
+  if (Buffer.isBuffer(data)) return data.toString('utf-8');
+  if (Array.isArray(data)) return Buffer.concat(data).toString('utf-8');
+  return Buffer.from(data).toString('utf-8');
+};

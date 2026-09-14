@@ -1,5 +1,6 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { fileURLToPath } from 'url';
 
 import {
   Logger as BlessLogger,
@@ -28,6 +29,7 @@ import {
   WebSocketRoute,
   availableBrowsers,
   dedent,
+  exists,
   getRouteFiles,
   makeExternalURL,
   normalizeFileProtocol,
@@ -49,10 +51,7 @@ type Implements<T> = {
 };
 
 type routeInstances =
-  | HTTPRoute
-  | BrowserHTTPRoute
-  | WebSocketRoute
-  | BrowserWebsocketRoute;
+  HTTPRoute | BrowserHTTPRoute | WebSocketRoute | BrowserWebsocketRoute;
 
 export class Browserless extends EventEmitter {
   protected logger: BlessLogger;
@@ -75,6 +74,10 @@ export class Browserless extends EventEmitter {
   server?: HTTPServer;
   metricsSaveInterval: number = 5 * 60 * 1000;
   metricsSaveIntervalID?: NodeJS.Timer;
+  // Most-recent entries kept in the metrics JSON file (~35 days at the
+  // default 5-minute cadence). Without a cap the file — and the in-memory
+  // cache plus every /metrics response built from it — grows forever.
+  metricsMaxEntries: number = 10_000;
 
   constructor({
     browserManager,
@@ -125,17 +128,20 @@ export class Browserless extends EventEmitter {
       );
     this.router =
       router ||
-      new Router(this.config, this.browserManager, this.limiter, this.Logger);
+      new Router(
+        this.config,
+        this.browserManager,
+        this.limiter,
+        this.Logger,
+        this.hooks,
+      );
   }
 
   // Filter out routes that are not able to work on the arm64 architecture
   // and log a message as to why that is (can't run Chrome on non-apple arm64)
   protected filterNonMacArm64Browsers(
     route:
-      | HTTPRoute
-      | BrowserHTTPRoute
-      | WebSocketRoute
-      | BrowserWebsocketRoute,
+      HTTPRoute | BrowserHTTPRoute | WebSocketRoute | BrowserWebsocketRoute,
   ) {
     if (
       isArm64 &&
@@ -155,11 +161,73 @@ export class Browserless extends EventEmitter {
   }
 
   protected async loadPwVersions(): Promise<void> {
-    const { playwrightVersions } = JSON.parse(
-      (await fs.readFile('package.json')).toString(),
+    // Consumer's package.json wins — downstream projects can declare their
+    // own playwrightVersions to override the SDK's defaults. Tolerate a
+    // missing consumer package.json (e.g. CWD detached from the project root)
+    // and fall back to the SDK's map below; surface other read/parse errors.
+    let consumerVersions: { [key: string]: string } | undefined;
+    try {
+      const consumerPkg = JSON.parse(
+        (await fs.readFile('package.json')).toString(),
+      );
+      consumerVersions = consumerPkg.playwrightVersions;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    }
+
+    if (consumerVersions) {
+      this.config.setPwVersions(consumerVersions);
+      return;
+    }
+
+    // SDK consumers don't (and shouldn't have to) mirror the SDK's
+    // playwrightVersions map in their own package.json. Fall back to the
+    // SDK package's own map.
+    const sdkPkgPath = fileURLToPath(
+      new URL('../package.json', import.meta.url),
+    );
+    const { playwrightVersions: sdkVersions } = JSON.parse(
+      (await fs.readFile(sdkPkgPath)).toString(),
     );
 
-    this.config.setPwVersions(playwrightVersions);
+    if (!sdkVersions) {
+      throw new Error(
+        `playwrightVersions is missing from both the consumer's package.json and the SDK's package.json at ${sdkPkgPath}. The SDK package is malformed.`,
+      );
+    }
+
+    this.config.setPwVersions(sdkVersions);
+  }
+
+  protected async loadInstalledBinaries(): Promise<void> {
+    const pwVersions = this.config.getPwVersions();
+    const browserTypes = ['chromium', 'firefox', 'webkit'] as const;
+
+    await Promise.all(
+      browserTypes.map(async (browserType) => {
+        const installed: Array<[number, string, string]> = [];
+
+        await Promise.all(
+          Object.keys(pwVersions).map(async (version) => {
+            const minor = parseFloat(version);
+            if (isNaN(minor)) return;
+
+            try {
+              const pw = await this.config.loadPwVersion(version);
+              const exePath = pw[browserType].executablePath();
+              if (await exists(exePath)) {
+                installed.push([minor, version, exePath]);
+              }
+            } catch {
+              // Package not installed, skip
+            }
+          }),
+        );
+
+        installed.sort(([a], [b]) => a - b);
+        this.config.setInstalledBinaries(browserType, installed);
+      }),
+    );
   }
 
   protected async saveMetrics(): Promise<void> {
@@ -192,10 +260,14 @@ export class Browserless extends EventEmitter {
 
     if (metricsPath) {
       this.logger.info(`Saving metrics to "${metricsPath}"`);
-      this.fileSystem.append(
+      // Awaited so a write rejection surfaces through saveMetrics()'s caller
+      // (the setInterval .catch below) instead of becoming an unhandled
+      // rejection — append() returns the raw, rejectable write task.
+      await this.fileSystem.append(
         metricsPath,
         JSON.stringify(aggregatedStats),
         false,
+        this.metricsMaxEntries,
       );
     }
   }
@@ -207,10 +279,15 @@ export class Browserless extends EventEmitter {
       );
     }
 
-    clearInterval(this.metricsSaveInterval);
+    // Clear the running timer (not the interval duration) or both timers
+    // keep firing and each one resets the other's metrics window.
+    clearInterval(this.metricsSaveIntervalID as unknown as number);
     this.metricsSaveInterval = interval;
     this.metricsSaveIntervalID = setInterval(
-      this.saveMetrics,
+      () =>
+        this.saveMetrics().catch((err) =>
+          this.logger.error(`Error saving metrics: ${err}`),
+        ),
       this.metricsSaveInterval,
     );
   }
@@ -281,7 +358,10 @@ export class Browserless extends EventEmitter {
     const debuggerURL =
       hasDebugger &&
       makeExternalURL(this.config.getExternalAddress(), `/debugger/?token=xxx`);
-    const docsLink = makeExternalURL(this.config.getExternalAddress(), '/docs/');
+    const docsLink = makeExternalURL(
+      this.config.getExternalAddress(),
+      '/docs/',
+    );
 
     this.logger.info(printLogo(docsLink, debuggerURL));
     this.logger.info(`Running as user "${userInfo().username}"`);
@@ -355,8 +435,7 @@ export class Browserless extends EventEmitter {
           default: Route,
         }: {
           default:
-            | Implements<WebSocketRoute>
-            | Implements<BrowserWebsocketRoute>;
+            Implements<WebSocketRoute> | Implements<BrowserWebsocketRoute>;
         } = await import(wsImport + `?cb=${Date.now()}`);
         const route = new Route(
           this.browserManager,
@@ -434,10 +513,14 @@ export class Browserless extends EventEmitter {
     );
 
     await this.loadPwVersions();
+    await this.loadInstalledBinaries();
     await this.server.start();
     this.logger.debug(`Starting metrics collection.`);
     this.metricsSaveIntervalID = setInterval(
-      () => this.saveMetrics(),
+      () =>
+        this.saveMetrics().catch((err) =>
+          this.logger.error(`Error saving metrics: ${err}`),
+        ),
       this.metricsSaveInterval,
     );
   }

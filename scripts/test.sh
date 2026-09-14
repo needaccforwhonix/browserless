@@ -1,13 +1,13 @@
 #!/bin/bash
 set -e
 
-# Install all dependencies for tests
-npm cache clean --force && rm -rf ./node_modules && rm ./package-lock.json && npm install
+# Install all dependencies for tests from the lockfile. --include=dev forces
+# devDependencies in even when the runtime image sets NODE_ENV=production.
+npm ci --include=dev
 
 # Setup Env Variables
 export DEBUG=-*
 export PUPPETEER_DISABLE_HEADLESS_WARNING=true
-export NODE_OPTIONS="--loader ts-node/esm"
 
 if [ -z "$DISPLAY" ]
 then
@@ -17,4 +17,4 @@ then
 fi
 
 # Run the tests
-./node_modules/.bin/_mocha --timeout 45000 --slow 10000 --exit $@ && kill -TERM $xvfb
+./node_modules/.bin/mocha --timeout 45000 --slow 10000 --exit $@ && kill -TERM $xvfb

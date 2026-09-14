@@ -193,7 +193,43 @@ describe('Request Shimming', () => {
     });
   });
 
+  describe('malformed launch', () => {
+    it('falls back to an empty launch object when launch is not a JSON object', () => {
+      // `?launch="foo"` parses to the primitive string "foo"; a legacy param
+      // triggers the shim, which then writes onto the parsed launch value. It
+      // must fall back to {} rather than throw on the non-object.
+      const url = 'wss://localhost?stealth=true&launch="foo"';
+      const final = 'wss://localhost/?launch={"stealth":true}';
+      const shimmed = shimLegacyRequests(new URL(url));
+
+      expect(decodeURIComponent(shimmed.href)).to.equal(final);
+    });
+  });
+
   describe('token shimming', () => {
+    for (const [url, expected] of [
+      [
+        '/profile/%2E/download?token=12345&timeout=5000',
+        '/profile/%2E/download?timeout=5000',
+      ],
+      ['/profile/%2E%2E/download?token=12345', '/profile/%2E%2E/download'],
+      ['wss://localhost?token=12345', '/'],
+      [
+        'https://localhost/profile/%2E/download?token=12345',
+        '/profile/%2E/download',
+      ],
+    ]) {
+      it(`preserves the raw pathname in ${url}`, () => {
+        const request = {
+          url,
+          headers: {},
+        } as unknown as http.IncomingMessage;
+
+        expect(moveTokenToHeader(request)).to.equal(expected);
+        expect(request.headers.authorization).to.equal('Bearer 12345');
+      });
+    }
+
     it('converts token query parameters to an authorization header', () => {
       const url = 'wss://localhost?token=12345';
       const shimmed = moveTokenToHeader({

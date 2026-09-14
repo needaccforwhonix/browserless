@@ -17,13 +17,21 @@ const shimParam = [
  * Obfuscates the ?token parameter by shifting it to a header instead of a query-parameter.
  */
 export function moveTokenToHeader(req: http.IncomingMessage): string {
-  const parsed = new URL(req.url || '', 'http://localhost');
-  const token = parsed.searchParams.get('token');
+  const requestUrl = req.url || '';
+  const queryStart = requestUrl.indexOf('?');
+  if (queryStart === -1) return requestUrl;
+
+  const rawPathname = requestUrl
+    .slice(0, queryStart)
+    .replace(/^[A-Za-z][A-Za-z\d+.-]*:\/\/[^/]*/, '');
+  const searchParams = new URLSearchParams(requestUrl.slice(queryStart + 1));
+  const token = searchParams.get('token');
 
   if (token) {
-    parsed.searchParams.delete('token');
+    searchParams.delete('token');
     req.headers.authorization = req.headers.authorization ?? `Bearer ${token}`;
-    req.url = parsed.pathname + parsed.search;
+    const search = searchParams.toString();
+    req.url = `${rawPathname || '/'}${search ? `?${search}` : ''}`;
   }
 
   return req.url!;
@@ -47,8 +55,18 @@ export function shimLegacyRequests(url: URL): URL {
     cliSwitches.length || shimParam.some((name) => names.includes(name));
 
   if (hasLegacyParams) {
-    const launchParams: CDPLaunchOptions =
-      safeParse(convertIfBase64(searchParams.get('launch') || '{}')) || {};
+    const parsedLaunch = safeParse(
+      convertIfBase64(searchParams.get('launch') || '{}'),
+    );
+    // The shim writes onto launchParams below, so fall back to {} unless the
+    // parsed value is a plain object — a primitive/array `launch` would throw.
+    const launchParams = (
+      parsedLaunch &&
+      typeof parsedLaunch === 'object' &&
+      !Array.isArray(parsedLaunch)
+        ? parsedLaunch
+        : {}
+    ) as CDPLaunchOptions;
     const ignoreDefaultArgs =
       searchParams.get('ignoreDefaultArgs') ?? launchParams.ignoreDefaultArgs;
     const ignoreHTTPSErrors =
