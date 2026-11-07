@@ -1,4 +1,5 @@
 import {
+  type Request,
   exists,
   isWin as isWindows,
   keyLength,
@@ -116,7 +117,7 @@ const getDebug = () => {
 
 /**
  * Chromium features Playwright disables by default, mirrored per supported
- * Playwright version (verified against playwright-core 1.59–1.63).
+ * Playwright version (verified against playwright-core 1.61–1.65).
  *
  * `--disable-features` is a single-valued Chromium switch: when it appears more
  * than once on the command line Chrome keeps ONLY the last occurrence — the
@@ -126,12 +127,12 @@ const getDebug = () => {
  * version itself disables or those features are silently re-enabled (e.g.
  * RenderDocument). See https://github.com/browserless/browserless/issues/5450
  *
- * The default is what the pinned playwright-core emits (1.63); versions whose
+ * The default is what the pinned playwright-core emits (1.65); versions whose
  * list differs are overridden below. These lists must stay 1:1 with the
  * installed Playwright versions — see the drift test in
  * browsers.playwright.spec.ts.
  */
-const defaultChromiumDisabledFeatures: readonly string[] = [
+const playwright163DisabledFeatures: readonly string[] = [
   'AvoidUnnecessaryBeforeUnloadCheckSync',
   'DestroyProfileOnBrowserClose',
   'DialMediaRouteProvider',
@@ -149,10 +150,38 @@ const defaultChromiumDisabledFeatures: readonly string[] = [
   'msEdgeUpdateLaunchServicesPreferredVersion',
 ];
 
-// 1.60 and 1.61 still disable RenderDocument (dropped in 1.62) and do not yet
+// 1.64 additionally prevents startup network-time and AI Mode queries;
+// 1.64.1 also disables the CORS URL loader restart on redirects.
+const playwright164DisabledFeatures: readonly string[] = [
+  ...playwright163DisabledFeatures,
+  'NetworkTimeServiceQuerying',
+  'AimEnabled',
+  'AvoidCorsURLLoaderRestartOnRedirect',
+];
+
+const defaultChromiumDisabledFeatures: readonly string[] = [
+  'AvoidUnnecessaryBeforeUnloadCheckSync',
+  'DestroyProfileOnBrowserClose',
+  'HttpsUpgrades',
+  'HttpsFirstBalancedModeAutoEnable',
+  'LensOverlay',
+  'MediaRouter',
+  'PaintHolding',
+  'ThirdPartyStoragePartitioning',
+  'AvoidCorsURLLoaderRestartOnRedirect',
+  'TcpPortRandomizationWin',
+  'OptimizationHints',
+  'NetworkTimeServiceQuerying',
+  'AimEnabled',
+  'PreconnectToSearch',
+  'msForceBrowserSignIn',
+  'msEdgeUpdateLaunchServicesPreferredVersion',
+];
+
+// 1.61 still disables RenderDocument (dropped in 1.62) and does not yet
 // disable BlockOriginHeaderModificationOnRedirect (added in 1.62 for
 // crbug/Chromium 149's redirect-header rejection).
-const playwright160And161DisabledFeatures: readonly string[] = [
+const playwright161DisabledFeatures: readonly string[] = [
   'AvoidUnnecessaryBeforeUnloadCheckSync',
   'BoundaryEventDispatchTracksNodeRemoval',
   'DestroyProfileOnBrowserClose',
@@ -171,36 +200,17 @@ const playwright160And161DisabledFeatures: readonly string[] = [
   'msEdgeUpdateLaunchServicesPreferredVersion',
 ];
 
-// 1.59 matches 1.60/1.61 except the ms*/Edge features, which Playwright
-// began disabling in 1.60.
-const playwright159DisabledFeatures: readonly string[] = [
-  'AvoidUnnecessaryBeforeUnloadCheckSync',
-  'BoundaryEventDispatchTracksNodeRemoval',
-  'DestroyProfileOnBrowserClose',
-  'DialMediaRouteProvider',
-  'GlobalMediaControls',
-  'HttpsUpgrades',
-  'LensOverlay',
-  'MediaRouter',
-  'PaintHolding',
-  'ThirdPartyStoragePartitioning',
-  'Translate',
-  'AutoDeElevate',
-  'RenderDocument',
-  'OptimizationHints',
-];
-
 const chromiumDisabledFeaturesByPwVersion: Readonly<
   Record<string, readonly string[]>
 > = {
-  '1.59': playwright159DisabledFeatures,
-  '1.60': playwright160And161DisabledFeatures,
-  '1.61': playwright160And161DisabledFeatures,
+  '1.61': playwright161DisabledFeatures,
   // Playwright stopped disabling this feature in 1.63.
   '1.62': [
-    ...defaultChromiumDisabledFeatures,
+    ...playwright163DisabledFeatures,
     'BoundaryEventDispatchTracksNodeRemoval',
   ],
+  '1.63': playwright163DisabledFeatures,
+  '1.64': playwright164DisabledFeatures,
 };
 
 /**
@@ -248,6 +258,7 @@ export class Config extends EventEmitter {
     : path.join(__dirname, '..', 'build', 'routes');
 
   protected token = process.env.TOKEN || null;
+  protected strictTokenUse = !!parseEnvVars(false, 'STRICT_TOKEN_USE');
   protected concurrent = +(
     process.env.CONCURRENT ??
     process.env.MAX_CONCURRENT_SESSIONS ??
@@ -295,6 +306,12 @@ export class Config extends EventEmitter {
     process.env.CPU_OVERLOAD_HYSTERESIS ?? '10'
   );
   protected maxPayloadSize = +(process.env.MAX_PAYLOAD_SIZE ?? '10485760'); // Default 10MB
+  protected cdpMaxInboundPayload = Config.validateCdpMaxInboundPayload(
+    process.env.CDP_MAX_INBOUND_PAYLOAD === undefined ||
+      process.env.CDP_MAX_INBOUND_PAYLOAD === ''
+      ? undefined
+      : Number(process.env.CDP_MAX_INBOUND_PAYLOAD),
+  );
   protected healthCheck = !!parseEnvVars(false, 'HEALTH');
   protected failedHealthURL = process.env.FAILED_HEALTH_URL ?? null;
   protected queueAlertURL = process.env.QUEUE_ALERT_URL ?? null;
@@ -325,6 +342,14 @@ export class Config extends EventEmitter {
 
   public getToken(): string | null {
     return this.token;
+  }
+
+  /**
+   * When true, the configured TOKEN is required on every route, including
+   * routes that opt out with `auth = false` (static files excepted).
+   */
+  public getStrictTokenUse(): boolean {
+    return this.strictTokenUse;
   }
 
   public getDebug(): string {
@@ -419,6 +444,30 @@ export class Config extends EventEmitter {
   public getBlockedNetworkRanges(): NetworkRangeSet | null {
     return null;
   }
+  /**
+   * Optional policy for native Playwright context creation. Subclasses may
+   * normalize options in place or reject creation by throwing. The bridge
+   * awaits this hook before forwarding the context or subsequent messages.
+   * The request belongs to this connection; overrides need not accept it.
+   */
+  public preparePlaywrightContextOptions(
+    options: Record<string, unknown>,
+    _request?: Request,
+  ): void | Promise<void> {
+    void options;
+    void _request;
+  }
+
+  /** Admission-only policy for raw CDP context creation; null keeps raw forwarding. */
+  public getCDPContextPolicy(
+    _request?: Request,
+  ):
+    | ((options: Readonly<Record<string, unknown>>) => void | Promise<void>)
+    | null {
+    void _request;
+    return null;
+  }
+
   public getCPULimit(): number {
     return this.maxCpu;
   }
@@ -454,6 +503,24 @@ export class Config extends EventEmitter {
   }
   public getMaxPayloadSize(): number {
     return this.maxPayloadSize;
+  }
+  /** Optional operator limit in bytes; transport defaults apply when unset. */
+  public getCdpMaxInboundPayload(): number | undefined {
+    return this.cdpMaxInboundPayload;
+  }
+  /** ws coerces limits to signed 32-bit integers; overflow can disable its cap. */
+  public static validateCdpMaxInboundPayload(
+    value: number | undefined,
+  ): number | undefined {
+    if (
+      value !== undefined &&
+      (!Number.isInteger(value) || value < 1 || value > 2147483647)
+    ) {
+      throw new Error(
+        'CDP_MAX_INBOUND_PAYLOAD must be an integer between 1 and 2147483647 bytes',
+      );
+    }
+    return value;
   }
   public getHealthChecksEnabled(): boolean {
     return this.healthCheck;
@@ -654,6 +721,11 @@ export class Config extends EventEmitter {
   public setToken(newToken: string | null): string | null {
     this.emit('token', newToken);
     return (this.token = newToken);
+  }
+
+  public setStrictTokenUse(strictTokenUse: boolean): boolean {
+    this.emit('strictTokenUse', strictTokenUse);
+    return (this.strictTokenUse = strictTokenUse);
   }
 
   public setTimeout(newTimeout: number): number {
